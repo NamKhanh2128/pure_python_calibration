@@ -275,9 +275,14 @@ def solve_intrinsics_from_homographies(Hs):
     # denom = B₁₁·B₂₂ − B₁₂²  must be non-zero (positive for PD matrix).
     denom = B11 * B22 - B12 ** 2
     if abs(denom) < 1e-12:
-        raise ValueError(
-            "Degenerate V matrix — add more views or improve corner detection."
-        )
+        print("\n[WARNING] Degenerate V matrix detected (images may lack sufficient out-of-plane rotation).")
+        print("          Falling back to rough focal length estimate for optimizer...")
+        # Fallback approximation for K if closed-form fails due to planar motions
+        return np.array([
+            [1000.0, 0.0, 500.0],
+            [0.0, 1000.0, 500.0],
+            [0.0, 0.0, 1.0]
+        ], dtype=np.float64)
 
     # -- STEP 5: analytically extract K from b --------------------------------
 

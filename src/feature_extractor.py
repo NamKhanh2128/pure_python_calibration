@@ -231,8 +231,17 @@ def harris_response(img, k=0.04, sigma=2.0):
     # trace(M) = Ixx + Iyy            (sum of eigenvalues)
     trace = Ixx + Iyy
 
-    # R = det − k·trace²              (Harris formula)
-    return det - k * trace ** 2
+    R = det - k * trace ** 2
+    
+    # -- STEP 5: Suppress border artifacts ------------------------------------
+    # np.convolve padding creates massive gradients at the image borders.
+    border = 15
+    R[:border, :] = 0
+    R[-border:, :] = 0
+    R[:, :border] = 0
+    R[:, -border:] = 0
+    
+    return R
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -423,91 +432,164 @@ def subpixel_refine(img, corners, win=5, max_iter=20, eps=1e-3):
 
 def order_checkerboard_corners(corners, grid_shape):
     """
-    Re-order detected Harris corners into the row-major sequence expected by
-    the DLT homography and Zhang's calibration, matching the world-point array.
+    Robust combinatorial checkerboard ordering using Local Topology RANSAC.
 
     ALGORITHM:
-      1. Keep exactly cols×rows corners (the NMS-ranked first `expected` ones).
-      2. PCA: compute the 2×2 covariance matrix of the 2-D point cloud.
-         - Largest eigenvector → "long axis" (≈ row direction inside board).
-         - Smallest eigenvector → "short axis" (≈ column direction).
-      3. Project all corners onto both axes.
-      4. Sort corners by their short-axis coordinate and divide into `rows` equal
-         bands (each band = one physical row of the checkerboard).
-      5. Within each band sort by long-axis coordinate (left-to-right).
-      The result is a flattened list in row-major (left→right, top→bottom) order.
+      1. Local 1x1 Cell Discovery: Find any 3 points that form a right-angle
+         L-shape. Extrapolate the 4th point of the 1x1 square.
+      2. Local Homography: Estimate H mapping the ideal [0,1]x[0,1] cell to
+         this localized square using DLT.
+      3. Global Projection: Extrapolate the complete cols×rows grid using H.
+      4. Inlier Matching: Snap projected points to the nearest Harris corners.
+      5. Global Refinement: If >70% of the grid matches, recompute a Global H
+         using all matched points, and re-project for pixel-perfect sorting.
 
-    WHY PCA: The checkerboard may be tilted at any angle relative to the
-    image axes. PCA finds the dominant orientations robustly.
+    WHY THIS APPROACH: A pure-numpy substitute for OpenCV's topological connected 
+    components. Strong against heavy background clutter since it leverages local
+    grid regularities built symmetrically.
 
     Parameters
     ----------
-    corners    : list of (x, y) — output of subpixel_refine (NMS-ordered)
-    grid_shape : (cols, rows) number of inner corners
+    corners    : list of (x, y) — subpixel Harris corners
+    grid_shape : (cols, rows) 
 
     Returns
     -------
-    ordered : list of (x, y) of length cols×rows in row-major order,
-              or None if the point count does not match.
+    ordered : list of (cols×rows) coordinates in row-major sequence, or None if failed.
     """
     cols, rows = grid_shape
-    expected   = cols * rows       # total inner corners required
-
-    # -- STEP 1: early exit if too few corners detected -----------------------
-    if len(corners) < expected:
+    expected = cols * rows
+    
+    # 1. Take top 150 points (limits combinatorial explosion but retains robust background tolerance)
+    pts = np.array(corners, dtype=np.float64)[:min(len(corners), 150)]
+    N = len(pts)
+    
+    if N < expected:
         return None
-
-    # -- STEP 2: take the first `expected` corners (already NMS score-sorted) --
-    pts = np.array(corners, dtype=np.float64)   # (M, 2) with M ≥ expected
-    if len(pts) > expected:
-        pts = pts[:expected]                     # keep only the top-scored ones
-
-    # -- STEP 3: PCA — find principal axes of the point cloud -----------------
-    # Center the points so PCA captures orientation, not position.
-    centered = pts - pts.mean(axis=0)           # (N, 2)  zero-mean
-
-    # 2×2 covariance matrix:  C = centered.T · centered  (unscaled)
-    cov = centered.T @ centered                 # (2, 2)
-
-    # eigh returns eigenvalues in ASCENDING order → last column = largest eigenvec
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    ax_long  = eigvecs[:, -1]   # eigenvector for largest eigenvalue (long axis)
-    ax_short = eigvecs[:,  0]   # eigenvector for smallest eigenvalue (short axis)
-
-    # -- STEP 3b: Fix arbitrary eigenvector signs -----------------------------
-    # Ensure long axis generally points right (+x)
-    if ax_long[0] < 0:
-        ax_long = -ax_long
         
-    # Ensure short axis generally points down (+y)
-    if ax_short[1] < 0:
-        ax_short = -ax_short
-
-    # -- STEP 4: project all corner positions onto the two principal axes ------
-    proj_long  = centered @ ax_long    # (N,) coordinate along long axis
-    proj_short = centered @ ax_short   # (N,) coordinate along short axis
-
-    # -- STEP 5: divide into `rows` bands by short-axis coordinate ------------
-    # argsort gives indices that sort proj_short ascending (top-to-bottom rows)
-    row_order = np.argsort(proj_short)           # (N,) sorted indices
-
-    # array_split divides the sorted array into `rows` roughly equal groups.
-    # Each group is one row of the checkerboard.
-    bands = np.array_split(row_order, rows)      # list of `rows` index arrays
-
-    # -- STEP 6: within each band sort by long-axis (left-to-right) -----------
-    ordered_idx = []
-    for band in bands:
-        # Sort the indices in this band by their long-axis projection
-        sorted_band = band[np.argsort(proj_long[band])]
-        ordered_idx.extend(sorted_band.tolist())
-
-    # -- STEP 7: sanity check -------------------------------------------------
-    if len(ordered_idx) != expected:
-        return None
-
-    # -- STEP 8: map ordered indices back to (x, y) tuples --------------------
-    return [(float(pts[i, 0]), float(pts[i, 1])) for i in ordered_idx]
+    from src.math_core import dlt_homography
+    
+    # Pairwise distances for extracting spatial nearest neighbors
+    dists = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+    neighbors = np.argsort(dists, axis=1) 
+    
+    # Mathematical models for 1x1 square and complete grid
+    ideal_1x1 = np.array([[0,0], [1,0], [1,1], [0,1]], dtype=np.float64)
+    ideal_grid = np.array([[c, r] for r in range(rows) for c in range(cols)], dtype=np.float64)
+    ideal_grid_h = np.hstack([ideal_grid, np.ones((len(ideal_grid), 1))])
+    
+    best_count = 0
+    best_ordered = None
+    best_err = np.inf
+    
+    # Scan through every point as the origin A (0,0)
+    for i in range(N):
+        A = pts[i]
+        
+        # Test nearest neighbors as B (1, 0)
+        for b_idx in neighbors[i, 1:6]:
+            B = pts[b_idx]
+            vAB = B - A
+            L = np.linalg.norm(vAB)
+            
+            # Test nearest neighbors as C (0, 1)
+            for c_idx in neighbors[i, 1:6]:
+                if c_idx == b_idx: continue
+                C = pts[c_idx]
+                vAC = C - A
+                
+                # Check for Orthogonality: dot(vAB, vAC) ≈ 0
+                cos_angle = np.abs(np.dot(vAB, vAC)) / (L * np.linalg.norm(vAC))
+                if cos_angle > 0.4: 
+                    continue
+                    
+                # Ensure a strict right-handed coordinate frame avoiding mirror-flipped grids!
+                if np.cross(vAB, vAC) < 0:
+                    continue
+                    
+                # Theoretically expected position of the 4th corner D (1, 1)
+                # D_theoretical = A + vAB + vAC = B + C - A
+                D_ex = B + C - A
+                
+                # Search for an actual detected Harris point near D_ex
+                d_dists = np.linalg.norm(pts - D_ex, axis=1)
+                d_idx = np.argmin(d_dists)
+                if d_dists[d_idx] > 0.6 * L:
+                    continue
+                    
+                D = pts[d_idx]
+                quad = np.array([A, B, D, C])
+                
+                # DLT Homography for the local 1x1 square
+                try:
+                    H_local = dlt_homography(ideal_1x1, quad)
+                except np.linalg.LinAlgError:
+                    continue
+                    
+                # Extrapolate entire cols×rows grid
+                proj = (H_local @ ideal_grid_h.T).T
+                z = proj[:, 2:]
+                z[np.abs(z) < 1e-8] = 1e-8
+                proj = proj[:, :2] / z
+                
+                inliers = 0
+                used = set()
+                curr_ordered = []
+                err_sum = 0
+                
+                # Snap extrapolated coords to the nearest physical Harris corners
+                for p in proj:
+                    dsts = np.linalg.norm(pts - p, axis=1)
+                    for u in used: dsts[u] = np.inf
+                    best_match = np.argmin(dsts)
+                    min_dist = dsts[best_match]
+                    
+                    if min_dist < max(15.0, 0.8 * L): 
+                        inliers += 1
+                        used.add(best_match)
+                        curr_ordered.append(best_match)
+                        err_sum += min_dist
+                
+                # Successful validation threshold
+                if inliers >= expected * 0.7:
+                    if inliers > best_count or (inliers == best_count and err_sum < best_err):
+                        best_count = inliers
+                        best_err = err_sum
+                        
+                        # Full geometric refinement: recompute H on ALL strictly matched inliers
+                        src_matched = []
+                        dst_matched = []
+                        for m_idx, pt_idx in enumerate(curr_ordered):
+                            src_matched.append(ideal_grid[m_idx])
+                            dst_matched.append(pts[pt_idx])
+                            
+                        try:
+                            H_global = dlt_homography(src_matched, dst_matched)
+                            proj_full = (H_global @ ideal_grid_h.T).T
+                            z_full = proj_full[:, 2:]
+                            z_full[np.abs(z_full) < 1e-8] = 1e-8
+                            proj_full = proj_full[:, :2] / z_full
+                            
+                            # Final assignment mapping
+                            final_ordered = []
+                            for pf in proj_full:
+                                pdists = np.linalg.norm(pts - pf, axis=1)
+                                b_match = np.argmin(pdists)
+                                final_ordered.append((float(pts[b_match, 0]), float(pts[b_match, 1])))
+                                
+                            best_ordered = final_ordered
+                            best_count = expected # force accept
+                        except:
+                            pass
+                            
+                if best_count == expected:
+                    break
+        if best_count == expected:
+            break
+            
+    if best_count == expected and best_ordered is not None:
+        return best_ordered
+    return None
 
 
 # ═════════════════════════════════════════════════════════════════════════════

@@ -42,16 +42,16 @@ MODEL_OUT = "models/camera_params.json"
 
 # Inner-corner grid: (number of cols, number of rows)
 # Example: a 10×7 board has (9, 6) inner corners
-GRID_SHAPE  = (9, 6)
+GRID_SHAPE  = (8, 8)
 
 # Physical size of one checkerboard square (mm, or any consistent unit)
-SQUARE_SIZE = 25.0
+SQUARE_SIZE = 18.0
 
 # Harris corner detector settings
 HARRIS_K      = 0.04    # sensitivity — range [0.04, 0.06]
 HARRIS_SIGMA  = 2.0     # Gaussian smoothing for structure tensor
-THRESH_REL    = 0.01    # NMS threshold as fraction of peak response
-MIN_DIST      = 10      # minimum separation (px) between corners
+THRESH_REL    = 0.05    # NMS threshold as fraction of peak response
+MIN_DIST      = 30      # minimum separation (px) between corners
 
 # Adam optimiser settings
 ADAM_LR       = 1e-3    # learning rate

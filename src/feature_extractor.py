@@ -460,8 +460,9 @@ def order_checkerboard_corners(corners, grid_shape):
     cols, rows = grid_shape
     expected = cols * rows
     
-    # 1. Take top 150 points (limits combinatorial explosion but retains robust background tolerance)
-    pts = np.array(corners, dtype=np.float64)[:min(len(corners), 150)]
+    # 1. Take top points (limits combinatorial explosion but retains robust background tolerance)
+    pts_limit = max(150, int(expected * 1.5))
+    pts = np.array(corners, dtype=np.float64)[:min(len(corners), pts_limit)]
     N = len(pts)
     
     if N < expected:
@@ -533,20 +534,21 @@ def order_checkerboard_corners(corners, grid_shape):
                 proj = proj[:, :2] / z
                 
                 inliers = 0
-                used = set()
                 curr_ordered = []
                 err_sum = 0
                 
+                # Fast vectorized distance matrix (cols*rows, N)
+                diff = proj[:, np.newaxis, :] - pts[np.newaxis, :, :]
+                dist_mat = np.linalg.norm(diff, axis=2)
+                
                 # Snap extrapolated coords to the nearest physical Harris corners
-                for p in proj:
-                    dsts = np.linalg.norm(pts - p, axis=1)
-                    for u in used: dsts[u] = np.inf
-                    best_match = np.argmin(dsts)
-                    min_dist = dsts[best_match]
+                for r in range(len(proj)):
+                    best_match = np.argmin(dist_mat[r])
+                    min_dist = dist_mat[r, best_match]
                     
                     if min_dist < max(15.0, 0.8 * L): 
                         inliers += 1
-                        used.add(best_match)
+                        dist_mat[:, best_match] = np.inf  # Mark column as used
                         curr_ordered.append(best_match)
                         err_sum += min_dist
                 
@@ -570,11 +572,15 @@ def order_checkerboard_corners(corners, grid_shape):
                             z_full[np.abs(z_full) < 1e-8] = 1e-8
                             proj_full = proj_full[:, :2] / z_full
                             
-                            # Final assignment mapping
+                            # Final assignment mapping with uniqueness
                             final_ordered = []
+                            used = set()
                             for pf in proj_full:
                                 pdists = np.linalg.norm(pts - pf, axis=1)
+                                for u in used:
+                                    pdists[u] = np.inf
                                 b_match = np.argmin(pdists)
+                                used.add(b_match)
                                 final_ordered.append((float(pts[b_match, 0]), float(pts[b_match, 1])))
                                 
                             best_ordered = final_ordered
@@ -588,6 +594,17 @@ def order_checkerboard_corners(corners, grid_shape):
             break
             
     if best_count == expected and best_ordered is not None:
+        # Enforce canonical orientation (Zhengyou Zhang calibration needs consistent point ordering)
+        # We ensure the diagonal from first to last point goes generally downwards, or rightwards if horizontal.
+        p_first = best_ordered[0]
+        p_last = best_ordered[-1]
+        
+        dy = p_last[1] - p_first[1]
+        dx = p_last[0] - p_first[0]
+        
+        if dy < -10 or (abs(dy) <= 10 and dx < 0):
+            best_ordered = best_ordered[::-1]
+            
         return best_ordered
     return None
 

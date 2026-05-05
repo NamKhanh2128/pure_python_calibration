@@ -32,7 +32,7 @@ from .optimizer import (
     pack_params,
     unpack_params,
     reprojection_rmse,
-    adam_optimize,
+    lm_optimize,
 )
 from .undistorter import (
     undistort_image,

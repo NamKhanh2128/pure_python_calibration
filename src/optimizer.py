@@ -260,125 +260,93 @@ def _numerical_gradient(params, obj_pts_list, img_pts_list, eps=1e-5):
 #    Reference: Kingma & Ba "Adam: A Method for Stochastic Optimization" (2015)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def adam_optimize(
+def lm_optimize(
     params,
     obj_pts_list,
     img_pts_list,
-    lr        = 1e-3,
-    beta1     = 0.9,
-    beta2     = 0.999,
-    epsilon   = 1e-8,
-    max_iter  = 500,
+    lam_init  = 1e-3,
+    lam_mult  = 10.0,
+    max_iter  = 100,
     tol       = 1e-7,
     verbose   = True,
-    log_every = 50,
+    log_every = 10,
 ):
     """
-    Minimize reprojection RMSE using the Adam first-order gradient optimizer.
+    Minimize reprojection RMSE using the Levenberg-Marquardt (LM) algorithm.
+    This exactly matches Zhang's non-linear optimization step.
 
-    ADAM UPDATE RULE (at each iteration t):
-      g    = ∂RMSE/∂p                     (gradient, computed numerically)
-
-      m    = β₁·m + (1−β₁)·g              (1st-moment estimate: EMA of g)
-      v    = β₂·v + (1−β₂)·g²             (2nd-moment estimate: EMA of g²)
-
-      m̂  = m / (1 − β₁ᵗ)                 (bias-corrected 1st moment)
-      v̂  = v / (1 − β₂ᵗ)                 (bias-corrected 2nd moment)
-
-      p   ← p − lr · m̂ / (√v̂ + ε)        (parameter update)
-
-    WHY ADAM:
-      • m̂ / (√v̂) is an adaptive per-parameter step: parameters with large
-        historic gradients get smaller updates (self-tuning).
-      • Bias correction terms (1−β₁ᵗ) and (1−β₂ᵗ) prevent under-estimation
-        of the moments during the early iterations when m and v are near 0.
-      • Works well when parameters have very different scales (e.g. fx≈800,
-        k1≈0.01) which is exactly the situation in camera calibration.
-
-    Parameters
-    ----------
-    params       : initial flat parameter vector  (from pack_params)
-    obj_pts_list : list of (N,3) world-point arrays (one per view)
-    img_pts_list : list of (N,2) observed image-point arrays (one per view)
-    lr           : learning rate α (default 1e-3)
-    beta1        : exponential decay for 1st moment  (default 0.9)
-    beta2        : exponential decay for 2nd moment  (default 0.999)
-    epsilon      : small constant for numerical stability  (default 1e-8)
-    max_iter     : maximum number of Adam update steps  (default 500)
-    tol          : stop if |RMSE[t] − RMSE[t-1]| < tol  (default 1e-7)
-    verbose      : whether to print progress
-    log_every    : print frequency in iterations
-
-    Returns
-    -------
-    best_params  : (6+6n,) parameter vector that achieved the lowest RMSE
-    loss_history : list of RMSE values, one per iteration
+    LM UPDATE RULE:
+      Δp = (Jᵀ·J + λ·diag(Jᵀ·J))⁻¹ · Jᵀ·r
     """
-    # -- INITIALIZATION -------------------------------------------------------
-    p = params.copy().astype(np.float64)  # working parameter copy
+    p = params.copy().astype(np.float64)
+    
+    def calc_residuals(p_curr):
+        return reprojection_error_vector(p_curr, obj_pts_list, img_pts_list)
+        
+    def calc_jacobian(p_curr, r_curr):
+        eps = 1e-5
+        # Jacobian shape: (num_residuals, num_params)
+        J = np.zeros((len(r_curr), len(p_curr)), dtype=np.float64)
+        for i in range(len(p_curr)):
+            p_plus = p_curr.copy()
+            p_plus[i] += eps
+            r_plus = calc_residuals(p_plus)
+            J[:, i] = (r_plus - r_curr) / eps
+        return J
 
-    # 1st-moment vector m, initialized to 0 (unbiased before any update)
-    m = np.zeros_like(p)
-
-    # 2nd-moment vector v, initialized to 0
-    v = np.zeros_like(p)
-
-    loss_hist = []                        # track RMSE per iteration
-
-    # evaluate initial loss
-    best_loss = reprojection_rmse(p, obj_pts_list, img_pts_list)
-    best_p    = p.copy()                  # best params seen so far
-
+    r = calc_residuals(p)
+    rmse = np.sqrt(np.mean(r**2))
+    lam = lam_init
+    
+    loss_hist = [rmse]
+    
     if verbose:
-        print(f"    [Adam] start  RMSE = {best_loss:.6f} px  "
+        print(f"    [LM] start  RMSE = {rmse:.6f} px  "
               f"(params={len(p)}, views={len(obj_pts_list)})")
 
-    # -- MAIN LOOP ------------------------------------------------------------
-    for t in range(1, max_iter + 1):
-
-        # ── STEP A: compute gradient via central finite differences ───────────
-        # g[i] ≈ [RMSE(p+ε·eᵢ) − RMSE(p−ε·eᵢ)] / (2ε)
-        g = _numerical_gradient(p, obj_pts_list, img_pts_list)
-
-        # ── STEP B: update biased 1st moment  m = β₁·m + (1−β₁)·g ───────────
-        # m is an exponential moving average of the gradient history.
-        m = beta1 * m + (1.0 - beta1) * g
-
-        # ── STEP C: update biased 2nd moment  v = β₂·v + (1−β₂)·g² ──────────
-        # v is an exponential moving average of the squared gradient.
-        v = beta2 * v + (1.0 - beta2) * g ** 2
-
-        # ── STEP D: bias correction ───────────────────────────────────────────
-        # At iteration t, m and v are initialized at 0, so they are biased
-        # towards zero for small t.  Correcting: m̂ = m/(1−β₁ᵗ)
-        m_hat = m / (1.0 - beta1 ** t)   # bias-corrected 1st moment
-        v_hat = v / (1.0 - beta2 ** t)   # bias-corrected 2nd moment
-
-        # ── STEP E: parameter update ──────────────────────────────────────────
-        # p ← p − lr · m̂ / (√v̂ + ε)
-        # The adaptive step size per parameter is: lr·|m̂ᵢ| / (√v̂ᵢ + ε)
-        # ε prevents division by zero when v̂ ≈ 0.
-        p -= lr * m_hat / (np.sqrt(v_hat) + epsilon)
-
-        # ── STEP F: evaluate updated RMSE and track best ──────────────────────
-        loss = reprojection_rmse(p, obj_pts_list, img_pts_list)
-        loss_hist.append(loss)
-
-        # keep the best parameter set seen across all iterations
-        if loss < best_loss:
-            best_loss = loss
-            best_p    = p.copy()
-
-        # ── STEP G: optional progress log ─────────────────────────────────────
-        if verbose and t % log_every == 0:
-            print(f"    [Adam iter {t:4d}] RMSE = {loss:.6f} px")
-
-        # ── STEP H: convergence check ─────────────────────────────────────────
-        # Stop early if the improvement between consecutive iterations is below tol.
-        # |RMSE[t] − RMSE[t-1]| < tol  ⟹  converged
-        if len(loss_hist) > 1 and abs(loss_hist[-2] - loss_hist[-1]) < tol:
+    for it in range(1, max_iter + 1):
+        J = calc_jacobian(p, r)
+        JtJ = J.T @ J
+        Jtr = J.T @ r
+        
+        # Levenberg-Marquardt step
+        step_accepted = False
+        for _ in range(10): # try up to 10 lambda increases
+            # H = JᵀJ + λ·diag(JᵀJ)
+            H = JtJ + lam * np.diag(np.diag(JtJ))
+            
+            # Guard against completely zero diagonal
+            if np.all(np.diag(H) == 0):
+                H = JtJ + lam * np.eye(len(p))
+                
+            try:
+                dp = np.linalg.solve(H, -Jtr)
+            except np.linalg.LinAlgError:
+                lam *= lam_mult
+                continue
+                
+            p_new = p + dp
+            r_new = calc_residuals(p_new)
+            rmse_new = float(np.sqrt(np.mean(r_new**2)))
+            
+            if rmse_new < rmse:
+                p = p_new
+                r = r_new
+                rmse = rmse_new
+                lam = max(lam / lam_mult, 1e-7)
+                step_accepted = True
+                break
+            else:
+                lam *= lam_mult
+                
+        loss_hist.append(rmse)
+        
+        if verbose and it % log_every == 0:
+            print(f"    [LM iter {it:3d}] RMSE = {rmse:.6f} px (λ={lam:.1e})")
+            
+        if not step_accepted or np.linalg.norm(dp) < tol:
             if verbose:
-                print(f"    [Adam] converged at iter {t},  RMSE = {loss:.6f} px")
+                print(f"    [LM] converged at iter {it},  RMSE = {rmse:.6f} px")
             break
 
-    return best_p, loss_hist   # best_p achieves best_loss; loss_hist for plotting
+    return p, loss_hist

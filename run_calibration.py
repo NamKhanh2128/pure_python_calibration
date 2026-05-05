@@ -13,6 +13,7 @@ Edit the CONFIGURATION block below to match your checkerboard and images.
 import os
 import json
 
+from PIL import Image, ImageDraw
 import numpy as np
 
 from src.feature_extractor import extract_all_views
@@ -25,9 +26,10 @@ from src.math_core import (
 from src.optimizer import (
     pack_params,
     unpack_params,
-    adam_optimize,
+    lm_optimize,
     reprojection_rmse,
 )
+from src.undistorter import undistort_image_file
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -40,12 +42,15 @@ CHECKERBOARD_DIR = "data/raw_checkerboards"
 # Where to write the calibration result
 MODEL_OUT = "models/camera_params.json"
 
+# Where to save the output images with detected corners
+DEBUG_OUT_DIR = "data/output_checkerboards"
+
 # Inner-corner grid: (number of cols, number of rows)
 # Example: a 10×7 board has (9, 6) inner corners
-GRID_SHAPE  = (8, 8)
+GRID_SHAPE  = (11, 17)
 
 # Physical size of one checkerboard square (mm, or any consistent unit)
-SQUARE_SIZE = 18.0
+SQUARE_SIZE = 9.0
 
 # Harris corner detector settings
 HARRIS_K      = 0.04    # sensitivity — range [0.04, 0.06]
@@ -86,6 +91,46 @@ def main():
         print("\n  ERROR: Need at least 3 valid checkerboard views — aborting.")
         return
 
+    # ── F1.5: Draw and save detected corners ─────────────────────────────────
+    print(f"\n[F1.5] Saving visualized corners to {DEBUG_OUT_DIR}")
+    os.makedirs(DEBUG_OUT_DIR, exist_ok=True)
+    for pts, path in zip(img_pts_list, valid_paths):
+        out_name = "detected_" + os.path.basename(path)
+        out_path = os.path.join(DEBUG_OUT_DIR, out_name)
+        
+        img = Image.open(path).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        cols, rows = GRID_SHAPE
+        
+        # Draw lines connecting the rows
+        for r in range(rows):
+            for c in range(cols - 1):
+                idx1 = r * cols + c
+                idx2 = r * cols + c + 1
+                pt1 = tuple(pts[idx1])
+                pt2 = tuple(pts[idx2])
+                draw.line([pt1, pt2], fill=(255, 0, 0), width=3)
+                
+        # Draw lines connecting the columns
+        for c in range(cols):
+            for r in range(rows - 1):
+                idx1 = r * cols + c
+                idx2 = (r + 1) * cols + c
+                pt1 = tuple(pts[idx1])
+                pt2 = tuple(pts[idx2])
+                draw.line([pt1, pt2], fill=(0, 255, 0), width=3)
+                
+        # Draw circles at each corner
+        for idx, pt in enumerate(pts):
+            x, y = pt
+            ratio = idx / (cols * rows)
+            color = (int(255 * ratio), int(255 * (1 - ratio)), 255)
+            r_circle = 4
+            draw.ellipse([x - r_circle, y - r_circle, x + r_circle, y + r_circle], fill=color, outline=(0, 0, 0))
+            
+        img.save(out_path)
+    print("  -> Done saving visualisations")
+
     # ── L1 : SVD — per-view homographies ─────────────────────────────────────
     print("\n[L1] SVD — Homographies (DLT, normalised)")
     Hs = []
@@ -117,14 +162,13 @@ def main():
     )
     print(f"  -> Initial RMSE = {rmse_init:.4f} px")
 
-    # ── O1 : Adam gradient descent ────────────────────────────────────────────
-    print("\n[O1] Adam Gradient Descent — Refinement")
+    # ── O1 : Levenberg-Marquardt optimization ─────────────────────────────────
+    print("\n[O1] Levenberg-Marquardt — Refinement")
     p0      = pack_params(K, dist_init, rvecs, ts)
-    p_opt, loss_hist = adam_optimize(
+    p_opt, loss_hist = lm_optimize(
         p0, obj_pts_list, img_pts_list,
-        lr        = ADAM_LR,
-        max_iter  = ADAM_ITER,
-        log_every = ADAM_LOG,
+        max_iter  = 50,
+        log_every = 10,
     )
     K_opt, dist_opt, rvecs_opt, ts_opt = unpack_params(p_opt, n_views)
     rmse_final = reprojection_rmse(p_opt, obj_pts_list, img_pts_list)
@@ -151,6 +195,31 @@ def main():
 
     print(f"\n  -> Model saved -> {MODEL_OUT}")
     print("=" * 60)
+
+    # ── Automatic Undistortion ────────────────────────────────────────────────
+    INPUT_DIR  = "data/raw_scenes"
+    OUTPUT_DIR = "data/output_flat"
+    
+    SUPPORTED = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
+    if os.path.isdir(INPUT_DIR):
+        print("\n" + "=" * 60)
+        print("  Image Undistortion  :  R2 (Inverse + Nearest-Neighbour)")
+        print("=" * 60)
+        
+        files = sorted(f for f in os.listdir(INPUT_DIR) if os.path.splitext(f)[1].lower() in SUPPORTED)
+        if files:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            for fname in files:
+                in_path  = os.path.join(INPUT_DIR,  fname)
+                out_path = os.path.join(OUTPUT_DIR, fname)
+                undistort_image_file(in_path, out_path, K_opt, dist_opt)
+                print(f"  [R2] {fname}  →  {out_path}")
+            print(f"\n  → {len(files)} image(s) written to '{OUTPUT_DIR}/'")
+            print("=" * 60)
+        else:
+            print(f"  No supported images found in '{INPUT_DIR}'. Skipping undistortion.")
+    else:
+        print(f"\n  [INFO] Input directory '{INPUT_DIR}' does not exist. Skipping undistortion.")
 
 
 if __name__ == "__main__":
